@@ -1,0 +1,32 @@
+# Local research, diagnostics and delivery files stay outside the source tree.
+/work/
+/outputs/
+/LanBoost-source.zip
+
+# Android / Gradle generated files and machine settings.
+.gradle/
+**/build/
+local.properties
+.DS_Store
+.idea/
+.vscode/
+*.iml
+*.hprof
+*.log
+*.apk
+*.aab
+*.apks
+*.zip
+
+# Private signing and environment configuration.
+*.jks
+*.keystore
+*.p12
+*.pfx
+signing.properties
+*.keystore.b64
+*.p12.b64
+.signing/
+.env
+.env.*
+!.env.example

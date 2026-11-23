@@ -1,0 +1,124 @@
+name: Android APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      signed_apk:
+        description: Build a fixed-signature APK (default branch only; requires signing secrets)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: android-${{ github.ref }}-${{ github.event_name }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Test, lint and build debug APK
+        run: >-
+          ./gradlew
+          :core:test :app:lintDebug :app:assembleDebug --no-daemon --no-configuration-cache
+      - name: Upload test reports
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: LanBoost-checks-${{ github.run_number }}
+          path: |
+            core/build/test-results/test/*.xml
+            app/build/reports/lint-results-debug.xml
+          if-no-files-found: ignore
+          retention-days: 14
+      - name: Upload debug build (temporary CI signature)
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: LanBoost-ci-debug-${{ github.run_number }}
+          path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
+  signed-apk:
+    needs: check
+    if: >-
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.signed_apk)) &&
+      github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Build with fixed signing certificate
+        env:
+          LANBOOST_KEYSTORE_BASE64: ${{ secrets.LANBOOST_KEYSTORE_BASE64 }}
+          LANBOOST_KEYSTORE_PASSWORD: ${{ secrets.LANBOOST_KEYSTORE_PASSWORD }}
+          LANBOOST_KEY_ALIAS: ${{ secrets.LANBOOST_KEY_ALIAS }}
+          LANBOOST_KEY_PASSWORD: ${{ secrets.LANBOOST_KEY_PASSWORD }}
+          LANBOOST_KEYSTORE_FILE: ${{ runner.temp }}/lanboost-signing.p12
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          names = ['LANBOOST_KEYSTORE_BASE64', 'LANBOOST_KEYSTORE_PASSWORD', 'LANBOOST_KEY_ALIAS', 'LANBOOST_KEY_PASSWORD']
+          if not all(os.environ.get(name) for name in names):
+              raise SystemExit('Missing signing secrets. See docs/SIGNING.md.')
+          try:
+              data = base64.b64decode(os.environ['LANBOOST_KEYSTORE_BASE64'], validate=True)
+          except ValueError:
+              raise SystemExit('Invalid keystore encoding.')
+          Path(os.environ['LANBOOST_KEYSTORE_FILE']).write_bytes(data)
+          PY
+          ./gradlew \
+            :app:lintRelease :app:assembleRelease --no-daemon --no-configuration-cache
+      - name: Verify signature and prepare artifacts
+        run: |
+          python3 scripts/verify-apk-signature.py \
+            app/build/outputs/apk/release/app-release.apk
+          cp app/build/outputs/apk/release/app-release.apk "$RUNNER_TEMP/LanBoost-release.apk"
+          cd "$RUNNER_TEMP"
+          sha256sum LanBoost-release.apk > SHA256SUMS.txt
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/lanboost-signing.p12"
+      - name: Upload signed APK and checksum
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: LanBoost-signed-${{ github.run_number }}
+          path: |
+            ${{ runner.temp }}/LanBoost-release.apk
+            ${{ runner.temp }}/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 30

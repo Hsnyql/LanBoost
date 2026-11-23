@@ -1,0 +1,133 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@d1374f8ac74474200d16ef8ecee22c7ae7a51880 # v6.3.0
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@be39fa834029ff78f1a44aa3bb0819b8fc2bd8fd # v4.0.4
+        with:
+          log-accepted-android-sdk-licenses: false
+      - name: Install Android SDK components
+        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Resolve version from tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          version_name=$(sed -nE "s/^[[:space:]]*versionName[[:space:]]+'([^']+)'[[:space:]]*$/\1/p" \
+            app/build.gradle)
+          if [ -z "$version_name" ]; then
+            echo 'Cannot read versionName from app/build.gradle.' >&2
+            exit 1
+          fi
+          if [ "v$version_name" != "$TAG" ]; then
+            echo "Tag $TAG does not match versionName $version_name; bump versionName or fix the tag." >&2
+            exit 1
+          fi
+          echo "VERSION_NAME=$version_name" >> "$GITHUB_ENV"
+      - name: Build with fixed signing certificate
+        env:
+          LANBOOST_KEYSTORE_BASE64: ${{ secrets.LANBOOST_KEYSTORE_BASE64 }}
+          LANBOOST_KEYSTORE_PASSWORD: ${{ secrets.LANBOOST_KEYSTORE_PASSWORD }}
+          LANBOOST_KEY_ALIAS: ${{ secrets.LANBOOST_KEY_ALIAS }}
+          LANBOOST_KEY_PASSWORD: ${{ secrets.LANBOOST_KEY_PASSWORD }}
+          LANBOOST_KEYSTORE_FILE: ${{ runner.temp }}/lanboost-signing.p12
+        run: |
+          set -euo pipefail
+          umask 077
+          python3 - <<'PY'
+          import base64, os
+          from pathlib import Path
+          names = ['LANBOOST_KEYSTORE_BASE64', 'LANBOOST_KEYSTORE_PASSWORD', 'LANBOOST_KEY_ALIAS', 'LANBOOST_KEY_PASSWORD']
+          if not all(os.environ.get(name) for name in names):
+              raise SystemExit('Missing signing secrets. See docs/SIGNING.md.')
+          try:
+              data = base64.b64decode(os.environ['LANBOOST_KEYSTORE_BASE64'], validate=True)
+          except ValueError:
+              raise SystemExit('Invalid keystore encoding.')
+          Path(os.environ['LANBOOST_KEYSTORE_FILE']).write_bytes(data)
+          PY
+          ./gradlew \
+            :core:test :app:lintRelease :app:assembleRelease --no-daemon --no-configuration-cache
+      - name: Verify signature, stage assets and write notes
+        run: |
+          set -euo pipefail
+          apk=app/build/outputs/apk/release/app-release.apk
+          python3 scripts/verify-apk-signature.py "$apk"
+          dist="$RUNNER_TEMP/dist"
+          mkdir -p "$dist"
+          cp "$apk" "$dist/LanBoost-${VERSION_NAME}.apk"
+          git archive --format=zip \
+            --prefix="LanBoost-${VERSION_NAME}-source/" \
+            -o "$dist/LanBoost-${VERSION_NAME}-source.zip" HEAD
+          (
+            cd "$dist"
+            sha256sum LanBoost-*.apk LanBoost-*.zip > SHA256SUMS.txt
+          )
+          fingerprint=$(cat signing-certificate.sha256)
+          cat > "$RUNNER_TEMP/RELEASE_NOTES.md" <<EOF
+          ## LanBoost ${VERSION_NAME}
+
+          适用于 Android 8.0 及以上。本版本由 GitHub Actions 运行核心测试和 Release lint 后构建，APK 已用固定证书验签。
+
+          项目原创实现采用 [GPL-3.0-only](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/LICENSE)，版权与第三方资料范围见 [NOTICE.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/NOTICE.md)。下方源码归档与本次 APK 对应；第三方组件保留各自许可证。
+
+          ### 附件
+
+          - \`LanBoost-${VERSION_NAME}.apk\`：固定签名 Release 安装包
+          - \`LanBoost-${VERSION_NAME}-source.zip\`：对应提交的源码归档
+          - \`SHA256SUMS.txt\`：上述附件的 SHA-256 校验值
+
+          ### 校验
+
+          签名证书 SHA-256：\`${fingerprint}\`
+
+          下载后在附件目录运行 \`sha256sum -c SHA256SUMS.txt\` 校验完整性。同包名、同签名的旧版本可直接覆盖升级；不同签名的包不能覆盖安装。安装步骤见 [README](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/README.md)，签名与本地构建见 [docs/SIGNING.md](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/blob/${GITHUB_REF_NAME}/docs/SIGNING.md)。
+          EOF
+      - name: Remove signing material
+        if: always()
+        run: rm -f "$RUNNER_TEMP/lanboost-signing.p12"
+      - name: Upload release artifacts to workflow run
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: LanBoost-release-${{ github.ref_name }}
+          path: ${{ runner.temp }}/dist/*
+          if-no-files-found: error
+          retention-days: 30
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          cd "$RUNNER_TEMP/dist"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" * --clobber
+            gh release edit "$GITHUB_REF_NAME" --draft=false \
+              --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md"
+          else
+            gh release create "$GITHUB_REF_NAME" * \
+              --title "LanBoost ${VERSION_NAME}" \
+              --notes-file "$RUNNER_TEMP/RELEASE_NOTES.md" \
+              --verify-tag
+          fi

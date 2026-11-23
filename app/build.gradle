@@ -1,0 +1,88 @@
+plugins { id 'com.android.application' }
+
+// Private credentials stay outside the checkout. CI supplies the same values through env vars.
+def signingProperties = new Properties()
+def signingPropertiesFile = new File(System.getenv('LANBOOST_SIGNING_PROPERTIES') ?:
+        new File(System.getProperty('user.home'), '.config/lanboost/signing/signing.properties').path)
+if (signingPropertiesFile.isFile()) {
+    signingPropertiesFile.withInputStream { signingProperties.load(it) }
+}
+def signingValue = { String envName, String propertyName ->
+    System.getenv(envName) ?: signingProperties.getProperty(propertyName)
+}
+def signingStore = signingValue('LANBOOST_KEYSTORE_FILE', 'storeFile')
+def signingStorePassword = signingValue('LANBOOST_KEYSTORE_PASSWORD', 'storePassword')
+def signingAlias = signingValue('LANBOOST_KEY_ALIAS', 'keyAlias')
+def signingKeyPassword = signingValue('LANBOOST_KEY_PASSWORD', 'keyPassword')
+def signingReady = [signingStore, signingStorePassword, signingAlias, signingKeyPassword].every { it }
+
+def verifyReleaseSigning = tasks.register('verifyReleaseSigning') {
+    doLast {
+        if (!signingReady) {
+            throw new GradleException('Release signing is not configured. See docs/SIGNING.md; no unsigned release will be built.')
+        }
+        try {
+            File keyFile = file(signingStore)
+            def store = java.security.KeyStore.getInstance(keyFile, signingStorePassword.toCharArray())
+            if (!store.isKeyEntry(signingAlias) || store.getKey(signingAlias, signingKeyPassword.toCharArray()) == null) {
+                throw new IllegalArgumentException('Missing private key')
+            }
+            String actual = java.security.MessageDigest.getInstance('SHA-256')
+                    .digest(store.getCertificate(signingAlias).encoded).encodeHex().toString()
+            String expected = rootProject.file('signing-certificate.sha256').text.trim().toLowerCase(java.util.Locale.ROOT)
+            if (!(expected ==~ /[0-9a-f]{64}/) || actual != expected) {
+                throw new IllegalArgumentException('Certificate mismatch')
+            }
+        } catch (Exception ignored) {
+            throw new GradleException('Release signing verification failed: check keystore, passwords, alias and certificate fingerprint. Credentials are not logged.')
+        }
+    }
+}
+tasks.configureEach { task ->
+    if (task.name == 'preReleaseBuild') task.dependsOn(verifyReleaseSigning)
+}
+// Bundle the canonical project notices without maintaining duplicate license copies.
+def licenseAssets = layout.buildDirectory.dir('generated/project-license-assets')
+def generateProjectLicenseAssets = tasks.register('generateProjectLicenseAssets', Copy) {
+    from(rootProject.file('LICENSE'))
+    from(rootProject.file('NOTICE.md'))
+    into(licenseAssets)
+}
+tasks.named('preBuild').configure { dependsOn(generateProjectLicenseAssets) }
+
+android {
+    sourceSets.main.assets.srcDir(licenseAssets)
+    namespace 'dev.lanboost.android'
+    compileSdk 35
+    defaultConfig {
+        applicationId 'dev.lanboost.android'
+        minSdk 26
+        targetSdk 35
+        versionCode 6
+        versionName '0.5.0'
+        testInstrumentationRunner 'dev.lanboost.android.DeviceChecks'
+    }
+    signingConfigs {
+        fixedRelease {
+            if (signingReady) {
+                storeFile file(signingStore)
+                storePassword signingStorePassword
+                keyAlias signingAlias
+                keyPassword signingKeyPassword
+            }
+        }
+    }
+    buildTypes {
+        release {
+            debuggable false
+            signingConfig signingConfigs.fixedRelease
+        }
+    }
+    compileOptions { sourceCompatibility JavaVersion.VERSION_17; targetCompatibility JavaVersion.VERSION_17 }
+    buildFeatures { buildConfig true }
+    packaging { resources.excludes += ['META-INF/INDEX.LIST', 'META-INF/DEPENDENCIES'] }
+}
+dependencies {
+    implementation project(':core')
+    implementation 'org.slf4j:slf4j-nop:2.0.16'
+}

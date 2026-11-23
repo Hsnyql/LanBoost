@@ -1,0 +1,6 @@
+# Copy outside the repository. Never commit the real file.
+# Set LANBOOST_SIGNING_PROPERTIES to its absolute path, or use the default in docs/SIGNING.md.
+storeFile=/absolute/path/to/lanboost.p12
+storePassword=REPLACE_WITH_PRIVATE_PASSWORD
+keyAlias=lanboost
+keyPassword=REPLACE_WITH_PRIVATE_PASSWORD
